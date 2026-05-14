@@ -16,12 +16,11 @@ def parse_currency(value_str):
     """Garante que a saída seja estritamente um número FLOAT, sem texto ou data"""
     if not value_str or pd.isna(value_str): return 0.0
     try:
-        # Se vier uma string como "11.205,34 em 10/04/2026", corta tudo a partir do espaço
         text_val = str(value_str).split(" em ")[0].split(" ")[0].upper()
         clean = text_val.replace("R$", "").strip()
         clean = re.sub(r'[^\d,\.]', '', clean)
         
-        # Corrige ponto isolado nos centavos (Erro comum do sistema da Receita)
+        # Corrige ponto isolado nos centavos
         if len(clean) >= 3 and clean[-3] in [',', '.']:
             cents = clean[-2:]
             reais = clean[:-3].replace('.', '').replace(',', '')
@@ -32,12 +31,10 @@ def parse_currency(value_str):
     except: return 0.0
 
 def extrair_data_sort(item):
-    """Ordenação cronológica matemática"""
     try: return datetime.strptime(item[0], "%d/%m/%Y")
     except: return datetime.min
 
 def formata_br(x):
-    """Apenas para exibição na tela do sistema (mantém o Excel com Float puro)"""
     if isinstance(x, (int, float)) and pd.notna(x):
         return f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     return ""
@@ -67,6 +64,22 @@ def inferir_modalidade(text):
     match_mod = re.search(r"Modalidade[:\s\.]*(.*?)(?=\n)", text, re.IGNORECASE)
     if match_mod: return match_mod.group(1).strip()
     return "Não identificada"
+
+def extrair_saldo_devedor(text):
+    """Procura o saldo devedor pulando quebras de linha e ignorando lixo do PDF"""
+    patterns = [
+        r"Saldo\s*Devedor\s*do\s*Parcelamento[\s\S]{0,40}?([\d\.]+[,.]\d{2})",
+        r"Saldo\s*devedor\s*em[\s\S]{0,40}?([\d\.]+[,.]\d{2})",
+        r"Saldo\s*Devedor\s*c(?:om|/)\s*Juros[\s\S]{0,40}?([\d\.]+[,.]\d{2})",
+        r"Valor\s*total\s*consolidado[\s\S]{0,40}?([\d\.]+[,.]\d{2})",
+        r"Total\s*Geral[\s\S]{0,40}?([\d\.]+[,.]\d{2})",
+        r"Saldo\s*Devedor[\s\S]{0,40}?([\d\.]+[,.]\d{2})"
+    ]
+    for pat in patterns:
+        matches = re.findall(pat, text, re.IGNORECASE)
+        valores = [parse_currency(m) for m in matches if parse_currency(m) > 0]
+        if valores: return max(valores) # Retorna o maior valor encontrado nesse padrão
+    return 0.0
 
 def extrair_metrica_parcelas(text):
     concedidas, restantes = 0, 0
@@ -101,14 +114,12 @@ def extrair_dicionario_historico(text):
 
     if not pagamentos: return {}, "N/D", 0.0
 
-    # Remove duplicatas exatas retendo datas reais
     unique_dict = { (d, v): True for d, v in pagamentos }
     pagamentos_unicos = list(unique_dict.keys())
     pagamentos_unicos.sort(key=extrair_data_sort)
 
     dict_parcelas = {}
     for i, p in enumerate(pagamentos_unicos, start=1):
-        # AQUI É AONDE A MÁGICA ACONTECE: Puxando EXCLUSIVAMENTE o Float
         dict_parcelas[f"Parcela {i}"] = p[1] 
 
     ultima_data = pagamentos_unicos[-1][0]
@@ -135,7 +146,6 @@ def processar(uploaded_file):
     
     orgao = "PGFN" if "PGFN" in full_text.upper() or "SISPAR" in full_text.upper() else "RFB"
 
-    # Lógica Condicional: DARF vs EXTRATO
     if is_darf:
         processo = "DARF/Guia"
         modalidade = "Pagamento Isolado"
@@ -156,8 +166,8 @@ def processar(uploaded_file):
         total_conc, restantes, pagas = extrair_metrica_parcelas(full_text)
         data_adesao = extrair_data_adesao(full_text)
         
-        saldo_match = re.search(r"Saldo\s*Devedor.*?([\d\.]+[,.]\d{2})", full_text, re.IGNORECASE)
-        saldo = parse_currency(saldo_match.group(1)) if saldo_match else 0.0
+        # <<< Restauração da Busca de Saldo Blindada >>>
+        saldo = extrair_saldo_devedor(full_text)
 
         parcelas, ultima_data, valor_ultima_parcela = extrair_dicionario_historico(full_text)
 
@@ -187,13 +197,13 @@ def processar(uploaded_file):
         "Total Concedido": total_conc,
         "Meses Já Pagos": pagas,
         "Parcelas Restantes": restantes,
-        "Data Último Pgto": ultima_data, # <<< DATA ISOLADA
+        "Data Último Pgto": ultima_data, 
         "Estimativa Quitação": data_quitacao,
-        "Saldo Devedor Atual": saldo, # <<< NÚMERO PURO
-        "Valor Última Parcela": valor_ultima_parcela, # <<< NÚMERO PURO
-        "Custo Projetado (Restante)": custo_projetado_restante, # <<< NÚMERO PURO
-        "Projeção em 300x": projecao_300x, # <<< NÚMERO PURO
-        "Diferença (Defasagem)": diferenca_defasagem # <<< NÚMERO PURO
+        "Saldo Devedor Atual": saldo, 
+        "Valor Última Parcela": valor_ultima_parcela, 
+        "Custo Projetado (Restante)": custo_projetado_restante, 
+        "Projeção em 300x": projecao_300x, 
+        "Diferença (Defasagem)": diferenca_defasagem 
     }
     
     resultado.update(parcelas)
@@ -213,7 +223,6 @@ if arquivos and st.button("Processar Dados Estruturados"):
         
     df = pd.DataFrame(dados)
     
-    # --- ORDENAÇÃO INTELIGENTE DE COLUNAS ---
     base_cols = [
         "Órgão", "Município", "Processo", "Modalidade", "Data Adesão", "Total Concedido", 
         "Meses Já Pagos", "Parcelas Restantes", "Data Último Pgto", "Estimativa Quitação", 
@@ -226,12 +235,10 @@ if arquivos and st.button("Processar Dados Estruturados"):
     final_cols = base_cols + parcela_cols
     df = df[final_cols]
     
-    # Ao invés de traços (-), as células vazias ficam nulas (Para não quebrar a matemática do Excel)
     df.fillna(value=pd.NA, inplace=True)
     
     st.success("Tabela Numérica Pura gerada com Sucesso!")
     
-    # --- FORMATAÇÃO VISUAL NA TELA ---
     formatos_tela = {
         "Saldo Devedor Atual": formata_br,
         "Valor Última Parcela": formata_br,
@@ -244,7 +251,6 @@ if arquivos and st.button("Processar Dados Estruturados"):
 
     st.dataframe(df.style.format(formatos_tela, na_rep=""), use_container_width=True)
     
-    # --- EXPORTAÇÃO EXCEL ---
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
         df.to_excel(writer, index=False, sheet_name='Projeções_e_Matriz')
