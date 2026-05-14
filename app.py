@@ -10,31 +10,63 @@ from datetime import datetime
 # --- CONFIGURAÇÃO ---
 st.set_page_config(page_title="Big Data Fiscal & Projeções", page_icon="🚀", layout="wide")
 
-# --- FUNÇÕES MATEMÁTICAS E DE LIMPEZA ---
+# --- FUNÇÕES MATEMÁTICAS (BLINDAGEM NUMÉRICA) ---
 
 def parse_currency(value_str):
-    if not value_str or value_str == "N/D": return 0.0
+    """Garante que a saída seja estritamente um número FLOAT, sem texto ou data"""
+    if not value_str or pd.isna(value_str): return 0.0
     try:
-        clean = str(value_str).replace(" ", "").replace("R$", "").strip()
+        # Se vier uma string como "11.205,34 em 10/04/2026", corta tudo a partir do espaço
+        text_val = str(value_str).split(" em ")[0].split(" ")[0].upper()
+        clean = text_val.replace("R$", "").strip()
+        clean = re.sub(r'[^\d,\.]', '', clean)
+        
+        # Corrige ponto isolado nos centavos (Erro comum do sistema da Receita)
         if len(clean) >= 3 and clean[-3] in [',', '.']:
             cents = clean[-2:]
             reais = clean[:-3].replace('.', '').replace(',', '')
             return float(f"{reais}.{cents}")
-        return float(re.sub(r'[^\d]', '', clean)) / 100
+        elif len(clean) > 0:
+            return float(re.sub(r'[^\d]', '', clean)) / 100
+        return 0.0
     except: return 0.0
 
 def extrair_data_sort(item):
+    """Ordenação cronológica matemática"""
     try: return datetime.strptime(item[0], "%d/%m/%Y")
     except: return datetime.min
 
 def formata_br(x):
-    """Formata float para o padrão brasileiro puro visual no Streamlit (Sem R$)"""
-    if isinstance(x, (int, float)):
-        if pd.isna(x): return ""
+    """Apenas para exibição na tela do sistema (mantém o Excel com Float puro)"""
+    if isinstance(x, (int, float)) and pd.notna(x):
         return f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    return str(x)
+    return ""
 
 # --- FUNÇÕES DE EXTRAÇÃO DO PDF ---
+
+def extrair_processo_extrato(text):
+    match_proc = re.search(r"(?:Processo|Negociaç[ãa]o|Conta|Parcelamento).*?[:\.]\s*([\d\.\-]+)", text, re.IGNORECASE)
+    if match_proc: return match_proc.group(1).strip()
+    return "Não informado"
+
+def inferir_modalidade(text):
+    mapa = {
+        "EC 113": "Especial EC 113/2021",
+        "13.485": "Especial Lei nº 13.485/17 - PREM",
+        "12.810": "Lei 12.810 OPP",
+        "SIMPLIFICADO": "Parcelamento Simplificado (OPP)",
+        "CONVENCIONAL": "Parcelamento Convencional",
+        "TRANSACAO EXCEPCIONAL": "Transação Excepcional",
+        "EDITAL PGDAU": "Transação por Adesão - PGDAU",
+        "PERT": "Pert IIIb",
+        "PASEP": "PASEP"
+    }
+    upper = text.upper()
+    for key, val in mapa.items():
+        if key in upper: return val
+    match_mod = re.search(r"Modalidade[:\s\.]*(.*?)(?=\n)", text, re.IGNORECASE)
+    if match_mod: return match_mod.group(1).strip()
+    return "Não identificada"
 
 def extrair_metrica_parcelas(text):
     concedidas, restantes = 0, 0
@@ -58,28 +90,29 @@ def extrair_dicionario_historico(text):
 
     p1 = re.findall(r"(\d{2}/\d{2}/\d{4})[\s\n]+([\d\.]+[,.]\d{2})[\s\n]+(\d{2}/\d{2}/\d{4})[\s\n]+([\d\.]+[,.]\d{2})", text_clean)
     for m in p1:
-        if parse_currency(m[3]) > 0:
-            pagamentos.append((m[2], m[3])) 
+        val = parse_currency(m[3])
+        if val > 0: pagamentos.append((m[2], val)) 
 
     if not pagamentos:
         p2 = re.findall(r"(\d{2}/\d{2}/\d{4})[\s\n]+([\d\.]+[,.]\d{2})[\s\n]+([\d\.]+[,.]\d{2})[\s\n]+([\d\.]+[,.]\d{2})", text_clean)
         for m in p2:
-            if parse_currency(m[1]) > 0:
-                pagamentos.append((m[0], m[1]))
+            val = parse_currency(m[1])
+            if val > 0: pagamentos.append((m[0], val))
 
-    if not pagamentos:
-        return {}, "N/D", 0.0
+    if not pagamentos: return {}, "N/D", 0.0
 
-    pagamentos_unicos = list(dict.fromkeys(pagamentos))
+    # Remove duplicatas exatas retendo datas reais
+    unique_dict = { (d, v): True for d, v in pagamentos }
+    pagamentos_unicos = list(unique_dict.keys())
     pagamentos_unicos.sort(key=extrair_data_sort)
 
     dict_parcelas = {}
     for i, p in enumerate(pagamentos_unicos, start=1):
-        # EXTRAI APENAS O VALOR NUMÉRICO FLOAT (Sem data, sem R$)
-        dict_parcelas[f"Parcela {i}"] = parse_currency(p[1])
+        # AQUI É AONDE A MÁGICA ACONTECE: Puxando EXCLUSIVAMENTE o Float
+        dict_parcelas[f"Parcela {i}"] = p[1] 
 
     ultima_data = pagamentos_unicos[-1][0]
-    ultimo_valor = parse_currency(pagamentos_unicos[-1][1])
+    ultimo_valor = pagamentos_unicos[-1][1]
 
     return dict_parcelas, ultima_data, ultimo_valor
 
@@ -95,18 +128,40 @@ def processar(uploaded_file):
         images = convert_from_bytes(pdf_bytes, dpi=300)
         full_text = "\n".join([pytesseract.image_to_string(img, lang='por') for img in images])
 
+    is_darf = "DARF" in full_text.upper() or "DOCUMENTO DE ARRECADA" in full_text.upper() or "DARF" in uploaded_file.name.upper()
+
     municipio_match = re.search(r"(?:Munic[íi]pio(?: de)?|Prefeitura)\s+([A-Za-zÀ-ÿ\s\-]+?)(?:\n|-|\d|CNPJ)", full_text, re.IGNORECASE)
-    municipio = municipio_match.group(1).strip() if municipio_match else uploaded_file.name
+    municipio = municipio_match.group(1).strip() if municipio_match else re.sub(r'(?i)\.pdf$|\s*-\s*(?:DARF|Extrato|PASEP).*', '', uploaded_file.name).strip()
+    
     orgao = "PGFN" if "PGFN" in full_text.upper() or "SISPAR" in full_text.upper() else "RFB"
-    
-    total_conc, restantes, pagas = extrair_metrica_parcelas(full_text)
-    data_adesao = extrair_data_adesao(full_text)
-    
-    saldo_match = re.search(r"Saldo\s*Devedor.*?([\d\.]+[,.]\d{2})", full_text, re.IGNORECASE)
-    saldo = parse_currency(saldo_match.group(1)) if saldo_match else 0.0
 
-    parcelas, ultima_data, valor_ultima_parcela = extrair_dicionario_historico(full_text)
+    # Lógica Condicional: DARF vs EXTRATO
+    if is_darf:
+        processo = "DARF/Guia"
+        modalidade = "Pagamento Isolado"
+        data_adesao = "N/D"
+        total_conc, restantes, pagas = 0, 0, 1
+        saldo = 0.0
+        
+        match_v = re.search(r"VALOR TOTAL[\s\n]*(?:R\$)?\s*([\d\.]+[,.]\d{2})", full_text, re.IGNORECASE)
+        valor_ultima_parcela = parse_currency(match_v.group(1)) if match_v else 0.0
+        
+        match_d = re.search(r"DATA DE VENCIMENTO[\s\n]*(\d{2}/\d{2}/\d{4})", full_text, re.IGNORECASE)
+        ultima_data = match_d.group(1).strip() if match_d else "N/D"
+        
+        parcelas = {"Parcela 1": valor_ultima_parcela}
+    else:
+        processo = extrair_processo_extrato(full_text)
+        modalidade = inferir_modalidade(full_text)
+        total_conc, restantes, pagas = extrair_metrica_parcelas(full_text)
+        data_adesao = extrair_data_adesao(full_text)
+        
+        saldo_match = re.search(r"Saldo\s*Devedor.*?([\d\.]+[,.]\d{2})", full_text, re.IGNORECASE)
+        saldo = parse_currency(saldo_match.group(1)) if saldo_match else 0.0
 
+        parcelas, ultima_data, valor_ultima_parcela = extrair_dicionario_historico(full_text)
+
+    # Projeção de Quitação
     data_quitacao = "N/D"
     if ultima_data != "N/D" and restantes > 0:
         try:
@@ -126,26 +181,30 @@ def processar(uploaded_file):
     resultado = {
         "Órgão": orgao,
         "Município": municipio,
+        "Processo": processo,
+        "Modalidade": modalidade,
         "Data Adesão": data_adesao,
         "Total Concedido": total_conc,
         "Meses Já Pagos": pagas,
         "Parcelas Restantes": restantes,
-        "Saldo Devedor Atual": saldo,
-        "Valor Última Parcela": valor_ultima_parcela,
+        "Data Último Pgto": ultima_data, # <<< DATA ISOLADA
         "Estimativa Quitação": data_quitacao,
-        "Custo Projetado (Restante)": custo_projetado_restante,
-        "Projeção em 300x": projecao_300x,
-        "Diferença (Defasagem)": diferenca_defasagem
+        "Saldo Devedor Atual": saldo, # <<< NÚMERO PURO
+        "Valor Última Parcela": valor_ultima_parcela, # <<< NÚMERO PURO
+        "Custo Projetado (Restante)": custo_projetado_restante, # <<< NÚMERO PURO
+        "Projeção em 300x": projecao_300x, # <<< NÚMERO PURO
+        "Diferença (Defasagem)": diferenca_defasagem # <<< NÚMERO PURO
     }
+    
     resultado.update(parcelas)
     return resultado
 
 # --- INTERFACE WEB (STREAMLIT) ---
-st.title("🚀 Big Data Fiscal & Motor de Projeções")
+st.title("🚀 Big Data Fiscal & Motor de Projeções (Valores Puros)")
 
-arquivos = st.file_uploader("Suba seus Extratos (PDF)", type=["pdf"], accept_multiple_files=True)
+arquivos = st.file_uploader("Suba seus Extratos e DARFs (PDF)", type=["pdf"], accept_multiple_files=True)
 
-if arquivos and st.button("Auditar, Projetar e Expandir"):
+if arquivos and st.button("Processar Dados Estruturados"):
     dados = []
     bar = st.progress(0)
     for i, arq in enumerate(arquivos):
@@ -154,10 +213,12 @@ if arquivos and st.button("Auditar, Projetar e Expandir"):
         
     df = pd.DataFrame(dados)
     
+    # --- ORDENAÇÃO INTELIGENTE DE COLUNAS ---
     base_cols = [
-        "Órgão", "Município", "Data Adesão", "Total Concedido", "Meses Já Pagos", 
-        "Parcelas Restantes", "Saldo Devedor Atual", "Valor Última Parcela", 
-        "Estimativa Quitação", "Custo Projetado (Restante)", "Projeção em 300x", "Diferença (Defasagem)"
+        "Órgão", "Município", "Processo", "Modalidade", "Data Adesão", "Total Concedido", 
+        "Meses Já Pagos", "Parcelas Restantes", "Data Último Pgto", "Estimativa Quitação", 
+        "Saldo Devedor Atual", "Valor Última Parcela", "Custo Projetado (Restante)", 
+        "Projeção em 300x", "Diferença (Defasagem)"
     ]
     parcela_cols = [c for c in df.columns if c.startswith("Parcela ")]
     parcela_cols.sort(key=lambda x: int(x.split(" ")[1])) 
@@ -165,9 +226,12 @@ if arquivos and st.button("Auditar, Projetar e Expandir"):
     final_cols = base_cols + parcela_cols
     df = df[final_cols]
     
-    st.success(f"Matriz de {len(parcela_cols)} colunas gerada com valores puros!")
+    # Ao invés de traços (-), as células vazias ficam nulas (Para não quebrar a matemática do Excel)
+    df.fillna(value=pd.NA, inplace=True)
     
-    # --- APLICA FORMATO BRASILEIRO PURO NA TELA ---
+    st.success("Tabela Numérica Pura gerada com Sucesso!")
+    
+    # --- FORMATAÇÃO VISUAL NA TELA ---
     formatos_tela = {
         "Saldo Devedor Atual": formata_br,
         "Valor Última Parcela": formata_br,
@@ -175,11 +239,10 @@ if arquivos and st.button("Auditar, Projetar e Expandir"):
         "Projeção em 300x": formata_br,
         "Diferença (Defasagem)": formata_br
     }
-    # Aplica o formato puro em todas as infinitas colunas de parcelas também
     for p_col in parcela_cols:
         formatos_tela[p_col] = formata_br
 
-    st.dataframe(df.style.format(formatos_tela), use_container_width=True)
+    st.dataframe(df.style.format(formatos_tela, na_rep=""), use_container_width=True)
     
     # --- EXPORTAÇÃO EXCEL ---
     buffer = io.BytesIO()
@@ -188,10 +251,10 @@ if arquivos and st.button("Auditar, Projetar e Expandir"):
         ws = writer.sheets['Projeções_e_Matriz']
         
         ws.set_column('A:A', 10) 
-        ws.set_column('B:B', 30) 
-        ws.set_column('C:F', 16) 
-        ws.set_column('G:L', 22) 
+        ws.set_column('B:D', 25) 
+        ws.set_column('E:J', 16) 
+        ws.set_column('K:O', 20) 
         if len(parcela_cols) > 0:
-            ws.set_column(12, 12 + len(parcela_cols), 16)
+            ws.set_column(15, 15 + len(parcela_cols), 15)
             
-    st.download_button("⬇️ Baixar Projeções em Excel", buffer.getvalue(), f"Projecao_Fiscal_{datetime.now().strftime('%d_%m_%H%M')}.xlsx")
+    st.download_button("⬇️ Baixar Projeções em Excel (.xlsx)", buffer.getvalue(), f"Projecao_Pura_{datetime.now().strftime('%d_%m_%H%M')}.xlsx")
