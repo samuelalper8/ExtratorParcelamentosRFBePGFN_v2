@@ -8,7 +8,7 @@ from pdf2image import convert_from_bytes
 from datetime import datetime
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Big Data Fiscal RFB/PGFN", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Big Data Fiscal & Projeções", page_icon="🚀", layout="wide")
 
 # --- FUNÇÕES MATEMÁTICAS E DE LIMPEZA ---
 
@@ -16,6 +16,7 @@ def parse_currency(value_str):
     if not value_str or value_str == "N/D": return 0.0
     try:
         clean = str(value_str).replace(" ", "").replace("R$", "").strip()
+        # Trata o ponto incorreto nos centavos da Receita (Ex: 11.205.34)
         if len(clean) >= 3 and clean[-3] in [',', '.']:
             cents = clean[-2:]
             reais = clean[:-3].replace('.', '').replace(',', '')
@@ -47,7 +48,7 @@ def extrair_data_adesao(text):
     return "Não informada"
 
 def extrair_dicionario_historico(text):
-    """Lê todas as tabelas e cria um dicionário {Parcela 1: Valor, Parcela 2: Valor...}"""
+    """Lê todas as tabelas e retorna: Dicionário de Parcelas, Última Data, Último Valor"""
     text_clean = re.sub(r'[\r\t]', ' ', text)
     pagamentos = []
 
@@ -64,20 +65,25 @@ def extrair_dicionario_historico(text):
             if parse_currency(m[1]) > 0:
                 pagamentos.append((m[0], m[1]))
 
+    if not pagamentos:
+        return {}, "N/D", 0.0
+
     # Remover duplicatas que o OCR possa ter gerado acidentalmente
     pagamentos_unicos = list(dict.fromkeys(pagamentos))
-    
     # Ordenar do mais antigo para o mais novo
     pagamentos_unicos.sort(key=extrair_data_sort)
 
     # Gerar colunas dinâmicas (Parcela 1 até Parcela N)
     dict_parcelas = {}
     for i, p in enumerate(pagamentos_unicos, start=1):
-        # Arruma casas decimais se tiver ponto invés de vírgula
         val_format = p[1][:-3] + "," + p[1][-2:] if p[1][-3] == '.' else p[1]
         dict_parcelas[f"Parcela {i}"] = f"R$ {val_format} em {p[0]}"
 
-    return dict_parcelas
+    # Capturar a Última Parcela para fazer as projeções matemáticas
+    ultima_data = pagamentos_unicos[-1][0]
+    ultimo_valor = parse_currency(pagamentos_unicos[-1][1])
+
+    return dict_parcelas, ultima_data, ultimo_valor
 
 def processar(uploaded_file):
     pdf_bytes = uploaded_file.read()
@@ -101,7 +107,29 @@ def processar(uploaded_file):
     saldo_match = re.search(r"Saldo\s*Devedor.*?([\d\.]+[,.]\d{2})", full_text, re.IGNORECASE)
     saldo = parse_currency(saldo_match.group(1)) if saldo_match else 0.0
 
-    # Estrutura Base
+    # Extrair Histórico e a "Base" para a Projeção
+    parcelas, ultima_data, valor_ultima_parcela = extrair_dicionario_historico(full_text)
+
+    # --- MOTOR DE PROJEÇÃO ATÉ A QUITAÇÃO ---
+    data_quitacao = "N/D"
+    if ultima_data != "N/D" and restantes > 0:
+        try:
+            # Soma os meses restantes à data do último pagamento para achar o mês da quitação
+            ud = datetime.strptime(ultima_data, "%d/%m/%Y")
+            m = ud.month - 1 + restantes
+            y = ud.year + m // 12
+            m = m % 12 + 1
+            data_quitacao = f"{m:02d}/{y}"
+        except: pass
+    elif restantes == 0 and ultima_data != "N/D":
+        data_quitacao = "Quitado"
+
+    # Cálculos Financeiros Projetados
+    custo_projetado_restante = valor_ultima_parcela * restantes
+    projecao_300x = valor_ultima_parcela * 300
+    diferenca_defasagem = saldo - custo_projetado_restante
+
+    # Estrutura Base (Tabela Principal)
     resultado = {
         "Órgão": orgao,
         "Município": municipio,
@@ -109,22 +137,26 @@ def processar(uploaded_file):
         "Total Concedido": total_conc,
         "Meses Já Pagos": pagas,
         "Parcelas Restantes": restantes,
-        "Saldo Devedor 05/2026": saldo,
+        "Saldo Devedor Atual": saldo,
+        "Valor Última Parcela": valor_ultima_parcela,
+        "Estimativa Quitação": data_quitacao,
+        "Custo Projetado (Restante)": custo_projetado_restante,
+        "Projeção em 300x": projecao_300x,
+        "Diferença (Defasagem)": diferenca_defasagem
     }
     
-    # Injetar matriz dinâmica de parcelas (expandir para a direita)
-    parcelas = extrair_dicionario_historico(full_text)
+    # Injetar a matriz de parcelas horizontal
     resultado.update(parcelas)
     
     return resultado
 
 # --- INTERFACE WEB (STREAMLIT) ---
-st.title("⭐ Matriz Dinâmica Fiscal: Histórico Completo")
-st.markdown("O sistema expandirá colunas infinitamente para a direita mapeando todas as parcelas pagas de cada Município.")
+st.title("🚀 Big Data Fiscal & Motor de Projeções")
+st.markdown("O sistema calcula a **Estimativa de Quitação**, projeta o **Custo Final** e expande o histórico completo na Matriz.")
 
 arquivos = st.file_uploader("Suba seus Extratos (PDF)", type=["pdf"], accept_multiple_files=True)
 
-if arquivos and st.button("Auditar Documentos e Expandir Matriz"):
+if arquivos and st.button("Auditar, Projetar e Expandir"):
     dados = []
     bar = st.progress(0)
     for i, arq in enumerate(arquivos):
@@ -134,34 +166,45 @@ if arquivos and st.button("Auditar Documentos e Expandir Matriz"):
     df = pd.DataFrame(dados)
     
     # --- ORDENAÇÃO INTELIGENTE DE COLUNAS ---
-    # Garante que as colunas fiquem na ordem matemática: Parcela 1, Parcela 2, ..., Parcela 240 (e não Parcela 1, 10, 100, 2)
-    base_cols = ["Órgão", "Município", "Data Adesão", "Total Concedido", "Meses Já Pagos", "Parcelas Restantes", "Saldo Devedor 05/2026"]
+    base_cols = [
+        "Órgão", "Município", "Data Adesão", "Total Concedido", "Meses Já Pagos", 
+        "Parcelas Restantes", "Saldo Devedor Atual", "Valor Última Parcela", 
+        "Estimativa Quitação", "Custo Projetado (Restante)", "Projeção em 300x", "Diferença (Defasagem)"
+    ]
     parcela_cols = [c for c in df.columns if c.startswith("Parcela ")]
-    parcela_cols.sort(key=lambda x: int(x.split(" ")[1])) # Classifica pelo número
+    parcela_cols.sort(key=lambda x: int(x.split(" ")[1])) # Classifica matematicamente (1, 2... 10... 240)
     
     final_cols = base_cols + parcela_cols
     df = df[final_cols]
     
-    # Preencher células vazias (quando um município tem 10 parcelas e o outro tem 100)
+    # Preencher células vazias da matriz com traço
     df.fillna("-", inplace=True)
     
-    st.success(f"Extração Concluída! Maior parcelamento detectado: {len(parcela_cols)} colunas de pagamento.")
-    st.dataframe(df)
+    st.success(f"Projeções e Matriz de {len(parcela_cols)} colunas geradas com sucesso!")
     
-    # --- EXPORTAÇÃO EXCEL PROFISSIONAL ---
+    # Exibir na tela as métricas formatadas em BRL
+    st.dataframe(df.style.format({
+        "Saldo Devedor Atual": "R$ {:,.2f}",
+        "Valor Última Parcela": "R$ {:,.2f}",
+        "Custo Projetado (Restante)": "R$ {:,.2f}",
+        "Projeção em 300x": "R$ {:,.2f}",
+        "Diferença (Defasagem)": "R$ {:,.2f}"
+    }), use_container_width=True)
+    
+    # --- EXPORTAÇÃO EXCEL BLINDADA ---
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-        df.to_excel(writer, index=False, sheet_name='Matriz_Expandida')
-        ws = writer.sheets['Matriz_Expandida']
+        df.to_excel(writer, index=False, sheet_name='Projeções_e_Matriz')
+        ws = writer.sheets['Projeções_e_Matriz']
         
-        # Formata colunas base
+        # Formatar larguras (Ajustado para o novo número de colunas)
         ws.set_column('A:A', 10) # Órgão
         ws.set_column('B:B', 30) # Município
-        ws.set_column('C:F', 16) # Métricas
-        ws.set_column('G:G', 22) # Saldo Devedor
+        ws.set_column('C:F', 16) # Métricas Básicas
+        ws.set_column('G:L', 22) # Valores de Saldo e Projeções Financeiras
         
-        # Formata todas as centenas de colunas de parcelas dinamicamente
+        # Formatar matriz infinita
         if len(parcela_cols) > 0:
-            ws.set_column(7, 7 + len(parcela_cols), 25) # Da coluna H (índice 7) até o final
+            ws.set_column(12, 12 + len(parcela_cols), 25) # Expande todas as parcelas
             
-    st.download_button("⬇️ Baixar Matriz em Excel", buffer.getvalue(), f"Matriz_Fiscal_{datetime.now().strftime('%d_%m_%H%M')}.xlsx")
+    st.download_button("⬇️ Baixar Projeções em Excel", buffer.getvalue(), f"Projecao_Fiscal_{datetime.now().strftime('%d_%m_%H%M')}.xlsx")
